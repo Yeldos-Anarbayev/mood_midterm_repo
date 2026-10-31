@@ -24,17 +24,22 @@
 
 ## Repository Contents
 
-- `group5_plbart_pipeline.py` — End-to-end Python ETL, 6-rule Data Quality Gate, 3NF SQLite Warehouse builder (`mood_group5_warehouse.db`), and Primary/Alternative PLBART evaluation pipeline.
-- `Midterm_Group5_PLBART.ipynb` — Executed Jupyter Notebook with inline outputs, SQL queries, and plots.
-- `Midterm_Group5_Report_MoOD.pdf` — 6-page A4 Technical Report covering all 7 Lectures, OOM logs, SQL Appendix, and visual charts.
-- `Midterm_Group5_Presentation.pdf` — 8-slide Widescreen Presentation Deck for the 10-minute defense.
-- `Midterm_Group5_Defense_Speech.pdf` — B1-level English speaking script and Q&A guide for each team member.
-- `mood_group5_warehouse.db` — Populated 3NF SQLite Data Warehouse (`22,890` clean governed records across 8 tables + 1 view).
-- `outputs/` & `figures/` — Generated CSV metrics, JSON summary, and 6 high-DPI visual diagrams.
+- `group5_plbart_pipeline.py` — End-to-end Python ETL, six-rule Data Quality Gate, 3NF SQLite warehouse builder, and model evaluation pipeline.
+- `requirements.txt` — Runtime dependencies for the pipeline.
+- `outputs/` and `mood_group5_warehouse.db` — Generated locally when the pipeline completes; they are not committed to this repository.
 
 ## How to Reproduce
 
+The pipeline expects these Lab 4 files in `../lab_04/data/` relative to this repository:
+
+- `vulnerability_samples_raw.csv`
+- `cwe_reference.csv`
+
+Install the dependencies and run the pipeline:
+
 ```bash
 pip install -r requirements.txt
-python3 group5_plbart_pipeline.py
+python group5_plbart_pipeline.py
 ```
+
+The command validates the input schema, quarantines invalid rows, builds the SQLite warehouse, and writes model metrics to `outputs/group5_model_metrics.csv`.
