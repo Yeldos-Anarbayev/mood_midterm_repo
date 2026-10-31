@@ -15,15 +15,12 @@ high-DPI publication figures.
 from __future__ import annotations
 
 import hashlib
-import json
 import sqlite3
 import time
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.patches import FancyBboxPatch
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
@@ -41,17 +38,16 @@ from sklearn.metrics import (
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 
-plt.rcParams["font.sans-serif"] = ["DejaVu Sans", "Arial", "Helvetica"]
-plt.rcParams["axes.unicode_minus"] = False
-
 BASE_DIR = Path(__file__).resolve().parent
 LAB4_DATA_DIR = BASE_DIR.parent / "lab_04" / "data"
 OUTPUTS_DIR = BASE_DIR / "outputs"
-FIGURES_DIR = BASE_DIR / "figures"
 DB_PATH = BASE_DIR / "mood_group5_warehouse.db"
 
-OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+
+def require_columns(df: pd.DataFrame, required: set[str], source: str) -> None:
+    missing = sorted(required.difference(df.columns))
+    if missing:
+        raise ValueError(f"{source} is missing required columns: {', '.join(missing)}")
 
 def engineer_plbart_code_features(df: pd.DataFrame) -> np.ndarray:
     """
@@ -86,9 +82,33 @@ def main() -> None:
     print("[1/6] Ingesting raw vulnerability dataset from Lab 4 / vul-llm-finetune...")
     raw_csv = LAB4_DATA_DIR / "vulnerability_samples_raw.csv"
     cwe_csv = LAB4_DATA_DIR / "cwe_reference.csv"
+    if not raw_csv.is_file() or not cwe_csv.is_file():
+        raise FileNotFoundError(
+            "Expected Lab 4 data files were not found. "
+            f"Looked in {LAB4_DATA_DIR}."
+        )
 
     raw_df = pd.read_csv(raw_csv)
     cwe_df = pd.read_csv(cwe_csv)
+    require_columns(
+        raw_df,
+        {
+            "code",
+            "split",
+            "cwe_id",
+            "label",
+            "review_status",
+            "sample_id",
+            "source_dataset",
+            "project_id",
+            "commit_id",
+            "partition_code",
+            "code_length",
+            "token_count",
+        },
+        raw_csv.name,
+    )
+    require_columns(cwe_df, {"cwe_id", "cwe_name", "severity"}, cwe_csv.name)
     total_raw = len(raw_df)
     print(f"      Loaded {total_raw:,} raw records and {len(cwe_df)} CWE definitions.")
 
@@ -110,6 +130,13 @@ def main() -> None:
     non_empty_code_mask = df["code_clean"].str.len() >= 10
     quarantine_mask = ~(valid_label_mask & non_empty_code_mask)
     quarantined_df = df[quarantine_mask].copy()
+    invalid_label_count = int((~valid_label_mask).sum())
+    short_code_count = int((valid_label_mask & ~non_empty_code_mask).sum())
+    quarantined_df["quarantine_reason"] = np.where(
+        ~valid_label_mask.loc[quarantined_df.index],
+        "invalid label",
+        "code body shorter than 10 characters",
+    )
 
     clean_df = df[~quarantine_mask].copy()
     clean_df["label"] = clean_df["label"].astype(float).astype(int)
@@ -195,6 +222,13 @@ def main() -> None:
             remediation_action TEXT NOT NULL
         );
 
+        CREATE TABLE quarantined_samples (
+            sample_id TEXT PRIMARY KEY,
+            code_text TEXT NOT NULL,
+            label TEXT,
+            quarantine_reason TEXT NOT NULL
+        );
+
         CREATE TABLE model_experiments (
             exp_id TEXT PRIMARY KEY,
             group_number INTEGER NOT NULL,
@@ -232,8 +266,8 @@ def main() -> None:
     cur.executemany(
         "INSERT INTO dataset_variants VALUES (?, ?, ?, ?, ?, ?)",
         [
-            ("X1_with_P3", "Imbalanced Full Benchmark (P1+P2+P3)", "https://github.com/rmusab/vul-llm-finetune", raw_sha, 22954, int((clean_df["source_dataset"].astype(str).str.contains("with_p3")).sum())),
-            ("X1_without_P3", "Balanced Commit-Pair Benchmark (P1+P2)", "https://github.com/rmusab/vul-llm-finetune", raw_sha, 1334, int((clean_df["source_dataset"].astype(str).str.contains("without_p3")).sum())),
+            ("X1_with_P3", "Imbalanced Full Benchmark (P1+P2+P3)", "https://github.com/rmusab/vul-llm-finetune", raw_sha, int((df["source_dataset"].astype(str).str.contains("with_p3")).sum()), int((clean_df["source_dataset"].astype(str).str.contains("with_p3")).sum())),
+            ("X1_without_P3", "Balanced Commit-Pair Benchmark (P1+P2)", "https://github.com/rmusab/vul-llm-finetune", raw_sha, int((df["source_dataset"].astype(str).str.contains("without_p3")).sum()), int((clean_df["source_dataset"].astype(str).str.contains("without_p3")).sum())),
         ],
     )
 
@@ -290,15 +324,27 @@ def main() -> None:
             for r in clean_df.itertuples()
         ],
     )
+    cur.executemany(
+        "INSERT INTO quarantined_samples VALUES (?, ?, ?, ?)",
+        [
+            (
+                str(row.sample_id),
+                str(row.code_clean),
+                str(row.label),
+                str(row.quarantine_reason),
+            )
+            for row in quarantined_df.itertuples()
+        ],
+    )
 
     # Insert DQ audit rules
     dq_rules = [
-        ("DQ-01", "Missing or corrupted binary vulnerability label", 18, "Quarantined to isolated table"),
-        ("DQ-02", "Empty or truncated Java method body (<10 chars)", 4, "Quarantined to isolated table"),
+        ("DQ-01", "Missing or corrupted binary vulnerability label", invalid_label_count, "Quarantined to isolated table"),
+        ("DQ-02", "Empty or truncated Java method body (<10 chars)", short_code_count, "Quarantined to isolated table"),
         ("DQ-03", "Exact and whitespace-normalized duplicate code bodies", duplicates_removed, "Deduplicated via SHA-256 fingerprint"),
-        ("DQ-04", "Cross-split commit leakage (train <-> test overlap)", 300, "Enforced GroupShuffleSplit by commit_id"),
-        ("DQ-05", "Non-canonical split and language tags", 176, "Normalized to {train, val, test} and Java"),
-        ("DQ-06", "Unmapped / missing CWE identifiers on safe functions", 3268, "Mapped to canonical CWE-UNMAPPED"),
+        ("DQ-04", "Cross-split commit leakage (train <-> test overlap)", 0, "Enforced GroupShuffleSplit by commit_id"),
+        ("DQ-05", "Non-canonical split and language tags", int((~df["split_norm"].isin(["train", "val", "test"])).sum()), "Normalized to {train, val, test} and Java"),
+        ("DQ-06", "Unmapped / missing CWE identifiers on safe functions", int((df["cwe_norm"] == "CWE-UNMAPPED").sum()), "Mapped to canonical CWE-UNMAPPED"),
     ]
     cur.executemany(
         "INSERT INTO dq_audit_log (rule_code, rule_description, affected_rows, remediation_action) VALUES (?, ?, ?, ?)",
@@ -338,7 +384,10 @@ def main() -> None:
     X_sparse_tr = hstack([Xw_tr, Xc_tr])
     X_sparse_te = hstack([Xw_te, Xc_te])
 
-    svd = TruncatedSVD(n_components=128, random_state=42)
+    n_components = min(128, X_sparse_tr.shape[1] - 1)
+    if n_components < 2:
+        raise ValueError("The training corpus does not contain enough features for SVD.")
+    svd = TruncatedSVD(n_components=n_components, random_state=42)
     Z_tr = svd.fit_transform(X_sparse_tr)
     Z_te = svd.transform(X_sparse_te)
 
@@ -460,7 +509,7 @@ def main() -> None:
         )
     conn.commit()
 
-    print("\n=== GROUP 5 EXPERIMENTAL RESULTS (TEST SPLIT n = 4,530) ===")
+    print(f"\n=== GROUP 5 EXPERIMENTAL RESULTS (TEST SPLIT n = {len(y_te):,}) ===")
     for m in metrics_list:
         print(
             f"  * {m['model_name']} [{m['method_role']}]:\n"
@@ -468,3 +517,11 @@ def main() -> None:
             f"Recall = {m['recall']:.4f} | F1 = {m['f1']:.4f} | ROC-AUC = {m['roc_auc']:.4f} | PR-AUC = {m['pr_auc']:.4f}\n"
             f"    Confusion Matrix: TP={m['tp']}, FP={m['fp']}, FN={m['fn']}, TN={m['tn']} | Time={m['train_time_sec']}s"
         )
+
+    conn.close()
+    print(f"\nCompleted in {time.time() - t0:.1f}s.")
+
+
+if __name__ == "__main__":
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    main()
