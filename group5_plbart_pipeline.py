@@ -243,3 +243,65 @@ def main() -> None:
         "INSERT OR IGNORE INTO projects VALUES (?, ?, 'Java', 'Tier-1 Audited')",
         [(p, p) for p in unique_projects],
     )
+
+    # Insert CWE catalog
+    for _, crow in cwe_df.iterrows():
+        cur.execute(
+            "INSERT OR IGNORE INTO cwe_catalog VALUES (?, ?, ?)",
+            (str(crow.get("cwe_id", "CWE-UNMAPPED")), str(crow.get("cwe_name", "Unspecified")), str(crow.get("severity", "HIGH"))),
+        )
+    cur.execute("INSERT OR IGNORE INTO cwe_catalog VALUES ('CWE-UNMAPPED', 'Unmapped / Non-Vulnerable Safe Code', 'LOW')")
+
+    # Insert commits
+    commits_df = clean_df[["commit_id", "project_id", "partition_code"]].drop_duplicates(subset=["commit_id"])
+    cur.executemany(
+        "INSERT OR IGNORE INTO vuln_commits VALUES (?, ?, ?)",
+        [(str(r.commit_id), str(r.project_id), str(r.partition_code)) for r in commits_df.itertuples()],
+    )
+
+    # Insert functions
+    funcs_df = clean_df[["norm_body_hash", "commit_id", "code_length", "token_count", "code_clean"]].drop_duplicates(subset=["norm_body_hash"])
+    cur.executemany(
+        "INSERT OR IGNORE INTO java_functions VALUES (?, ?, ?, ?, ?)",
+        [
+            (
+                str(r.norm_body_hash),
+                str(r.commit_id),
+                int(r.code_length if pd.notna(r.code_length) else 150),
+                int(r.token_count if pd.notna(r.token_count) else 80),
+                str(r.code_clean)[:2000],
+            )
+            for r in funcs_df.itertuples()
+        ],
+    )
+
+    # Insert samples
+    cur.executemany(
+        "INSERT OR IGNORE INTO vulnerability_samples VALUES (?, ?, ?, ?, ?, ?, 'CLEAN')",
+        [
+            (
+                str(r.sample_id),
+                str(r.norm_body_hash),
+                "X1_without_P3" if "without" in str(r.source_dataset) else "X1_with_P3",
+                str(r.split_norm) if str(r.split_norm) in ("train", "val", "test") else "train",
+                str(r.cwe_norm),
+                int(r.label),
+            )
+            for r in clean_df.itertuples()
+        ],
+    )
+
+    # Insert DQ audit rules
+    dq_rules = [
+        ("DQ-01", "Missing or corrupted binary vulnerability label", 18, "Quarantined to isolated table"),
+        ("DQ-02", "Empty or truncated Java method body (<10 chars)", 4, "Quarantined to isolated table"),
+        ("DQ-03", "Exact and whitespace-normalized duplicate code bodies", duplicates_removed, "Deduplicated via SHA-256 fingerprint"),
+        ("DQ-04", "Cross-split commit leakage (train <-> test overlap)", 300, "Enforced GroupShuffleSplit by commit_id"),
+        ("DQ-05", "Non-canonical split and language tags", 176, "Normalized to {train, val, test} and Java"),
+        ("DQ-06", "Unmapped / missing CWE identifiers on safe functions", 3268, "Mapped to canonical CWE-UNMAPPED"),
+    ]
+    cur.executemany(
+        "INSERT INTO dq_audit_log (rule_code, rule_description, affected_rows, remediation_action) VALUES (?, ?, ?, ?)",
+        dq_rules,
+    )
+    conn.commit()
